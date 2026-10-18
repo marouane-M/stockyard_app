@@ -10,6 +10,7 @@ from .geometry import scanner_matrix, boom_matrix, transform_points, process_sca
 from .inventory import Inventory, NX, NY, CELL, X0, Y0, deposit_footprint
 from .journal import Journal
 from .deposition import deposit_mound
+from .job_planning import validate_job_plan
 
 
 class Engine:
@@ -65,6 +66,7 @@ class Engine:
         self.measured_seq = np.full(NX*NY, -1, dtype=int)
         self.revision = getattr(self, "revision", 0) + 1
         self.error = None
+        self.active_job_id = None
 
     def configuration(self) -> dict:
         return {"machine": self.machine_config.model_dump(), "scanner": self.scanner_config.model_dump(),
@@ -183,10 +185,12 @@ class Engine:
     def _storage_to_profile(self, storage_type: str) -> str:
         return "gaussian" if storage_type == "gaussian" else "mound"
 
-    def _job_template(self, job_id: str, cfg: dict, operator: str, reason: str) -> dict:
+    def _job_template(self, job_id: str, cfg: dict, operator: str, reason: str, validation: dict) -> dict:
         return {"id": job_id, "name": cfg["name"], "status": "PRET", "created_at": time.time(),
                 "started_at": None, "finished_at": None, "operator": operator, "reason": reason,
-                "config": cfg, "current_pass_index": 0, "progress_pct": 0.0,
+                "config": cfg, "validation": validation, "plan": validation.get("planned_passes", []),
+                "current_pass_index": 0, "progress_pct": 0.0,
+                "positioning_target_m": None, "distance_remaining_m": 0.0,
                 "message": "Job prêt à lancer", "results": self._empty_job_results(cfg)}
 
     def _empty_job_results(self, cfg: dict) -> dict:
@@ -197,14 +201,19 @@ class Engine:
                             "deposited_tonnage_t": 0.0, "status": "EN_ATTENTE"}
                            for i, p in enumerate(cfg["passes"])]}
 
+    def validate_job(self, config: SimulationJobConfig) -> dict:
+        return validate_job_plan(config, self.products, self.truth.heights, self.truth.product_volume,
+                                 self.machine_config, assume_empty=config.reset_before_start)
+
     def create_job(self, payload: SimulationJobCreate) -> dict:
-        ids = {p.id for p in self.products}
-        for step in payload.config.passes:
-            if step.product_id not in ids:
-                raise ValueError(f"Produit inconnu dans le job : {step.product_id}")
+        validation = self.validate_job(payload.config)
+        if not validation["valid"]:
+            messages = " ".join(error["message"] for error in validation["errors"][:3])
+            raise ValueError(messages or "Le job ne respecte pas les règles de stockage.")
         job_id = f"JOB-{len(self.jobs)+1:04}-{uuid.uuid4().hex[:6].upper()}"
         event = {"type": "job_created", "at": time.time(), "job_id": job_id,
-                 "job": self._job_template(job_id, payload.config.model_dump(), payload.operator, payload.reason)}
+                 "job": self._job_template(job_id, payload.config.model_dump(), payload.operator,
+                                           payload.reason, validation)}
         self.journal.append(event)
         self._replay(event)
         self.revision += 1
@@ -214,14 +223,18 @@ class Engine:
         if e["type"] == "job_created":
             job = e["job"]
             job.setdefault("results", self._empty_job_results(job["config"]))
+            job.setdefault("validation", {"valid": True, "planned_passes": job.get("plan", [])})
+            job.setdefault("plan", job["validation"].get("planned_passes", []))
+            job.setdefault("positioning_target_m", None)
+            job.setdefault("distance_remaining_m", 0.0)
             self.jobs[job["id"]] = job
         elif e["type"] == "job_state":
             job = self.jobs[e["job_id"]]
             before = job.get("status")
             job.update(e["changes"])
-            if job.get("status") == "EN_COURS":
+            if job.get("status") in ("EN_DEPLACEMENT", "EN_POSITIONNEMENT", "EN_COURS"):
                 self.active_job_id = job["id"]
-            elif self.active_job_id == job["id"] and job.get("status") in ("TERMINE", "ARRETE", "EN_PAUSE", "ERREUR"):
+            elif self.active_job_id == job["id"] and job.get("status") in ("TERMINE", "ARRETE", "EN_PAUSE", "ERREUR", "REFUSE"):
                 self.active_job_id = None
             if before != job.get("status"):
                 self.audit.append(e)
@@ -229,7 +242,7 @@ class Engine:
     def _active_job(self) -> dict | None:
         if self.active_job_id:
             job = self.jobs.get(self.active_job_id)
-            if job and job.get("status") == "EN_COURS":
+            if job and job.get("status") in ("EN_DEPLACEMENT", "EN_POSITIONNEMENT", "EN_COURS"):
                 return job
         return None
 
@@ -248,6 +261,87 @@ class Engine:
                 return product
         raise ValueError("Produit inconnu dans la configuration.")
 
+    def _pass_target(self, job: dict, index: int) -> float:
+        plan = job["plan"][index]
+        direction = plan.get("direction", "auto")
+        if direction == "backward":
+            return float(plan["x1"])
+        return float(plan["x0"])
+
+    def _restore_machine_after_job(self, job: dict):
+        previous = job.get("machine_before_job")
+        if previous:
+            restored = MachineConfig(**previous)
+            config = {"machine": restored.model_dump(), "scanner": self.scanner_config.model_dump(),
+                      "site": self.site.model_dump(), "products": [p.model_dump() for p in self.products],
+                      "version": self.config_version + 1}
+            event = {"type": "config", "at": time.time(), "operator": job.get("operator", "Opérateur démo"),
+                     "reason": f"Restauration des réglages après le job {job['name']}",
+                     "before": self.configuration(), "config": config}
+            self.journal.append(event)
+            self._load_config(config)
+            self.audit.append(event)
+            self.travel = float(np.clip(self.travel, restored.travel_min_m, restored.travel_max_m))
+
+    def _schedule_pass_positioning(self, job: dict, index: int):
+        target = self._pass_target(job, index)
+        job["current_pass_index"] = index
+        job["positioning_target_m"] = target
+        job["distance_remaining_m"] = abs(target - self.travel)
+        self.direction = 1 if target >= self.travel else -1
+        changes = {
+            "status": "EN_DEPLACEMENT",
+            "current_pass_index": index,
+            "positioning_target_m": target,
+            "distance_remaining_m": job["distance_remaining_m"],
+            "message": f"Déplacement vers le point de départ du passage {index + 1}",
+        }
+        event = {"type": "job_state", "at": time.time(), "job_id": job["id"], "changes": changes}
+        self.journal.append(event)
+        self._apply_job_event(event)
+
+    def _begin_current_pass(self, job: dict):
+        index = int(job.get("current_pass_index", 0))
+        plan = job["plan"][index]
+        self.machine_config.travel_min_m = float(plan["x0"])
+        self.machine_config.travel_max_m = float(plan["x1"])
+        self.machine_config.product_id = plan["product_id"]
+        if plan.get("lane") in ("north", "south"):
+            self.machine_config.lane = plan["lane"]
+        direction = plan.get("direction", "auto")
+        if direction == "backward":
+            self.direction = -1
+            self.travel = float(plan["x1"])
+        else:
+            self.direction = 1
+            self.travel = float(plan["x0"])
+        event = {"type": "job_state", "at": time.time(), "job_id": job["id"],
+                 "changes": {"status": "EN_COURS", "positioning_target_m": None,
+                             "distance_remaining_m": 0.0,
+                             "message": f"Stockage du produit {plan['product_name']} — passage {index + 1}/{len(job['plan'])}"}}
+        self.journal.append(event)
+        self._apply_job_event(event)
+
+    def _advance_job_positioning(self, dt: float):
+        job = self._active_job()
+        if not job or job.get("status") != "EN_DEPLACEMENT":
+            return
+        target = float(job.get("positioning_target_m", self.travel))
+        distance = target - self.travel
+        step = self.machine_config.speed_m_s * dt * self.machine_config.time_scale
+        self.simulation_time += dt * self.machine_config.time_scale
+        if abs(distance) <= step + 1e-9:
+            self.travel = target
+            job["distance_remaining_m"] = 0.0
+            self._begin_current_pass(job)
+        else:
+            self.direction = 1 if distance > 0 else -1
+            self.travel += self.direction * step
+            remaining = abs(target - self.travel)
+            job["distance_remaining_m"] = remaining
+            job["message"] = f"Déplacement vers le point de départ — {remaining:.1f} m restants"
+        self.revision += 1
+
     def job_action(self, job_id: str, action: str, confirm: bool = False) -> dict:
         if job_id not in self.jobs:
             raise ValueError("Job de simulation inconnu.")
@@ -258,14 +352,27 @@ class Engine:
             if self.running:
                 raise ValueError("Arrêtez le simulateur actif avant de lancer ce job.")
             cfg = SimulationJobConfig(**job["config"])
+            validation = self.validate_job(cfg)
+            if not validation["valid"]:
+                job["validation"] = validation
+                event = {"type": "job_state", "at": now, "job_id": job_id,
+                         "changes": {"status": "REFUSE", "validation": validation,
+                                     "message": validation["summary"]}}
+                self.journal.append(event); self._apply_job_event(event); self.revision += 1
+                raise ValueError(" ".join(error["message"] for error in validation["errors"][:3]))
             if cfg.reset_before_start:
                 event = {"type": "reset", "at": now, "instance": str(uuid.uuid4()), "config": self.configuration()}
                 self.journal.append(event)
                 self._replay(event)
+                validation = self.validate_job(cfg)
             mc = self.machine_config.model_copy(deep=True)
-            mc.travel_min_m = cfg.start_m; mc.travel_max_m = cfg.end_m
-            mc.speed_m_s = cfg.travel_speed_m_s; mc.flow_t_h = cfg.flow_t_h; mc.time_scale = cfg.time_scale
-            mc.lane = cfg.lane; mc.auto_products = False; mc.alternate_lanes = cfg.storage_type == "alternating"
+            job["machine_before_job"] = mc.model_dump()
+            mc.speed_m_s = cfg.travel_speed_m_s
+            mc.flow_t_h = cfg.flow_t_h
+            mc.time_scale = cfg.time_scale
+            mc.lane = cfg.lane
+            mc.auto_products = False
+            mc.alternate_lanes = False
             mc.deposition_profile = self._storage_to_profile(cfg.storage_type)
             mc.repose_angle_deg = 38.0 if cfg.storage_type == "conical" else mc.repose_angle_deg
             mc.product_id = cfg.passes[0].product_id
@@ -275,32 +382,37 @@ class Engine:
             ce = {"type": "config", "at": now, "operator": job.get("operator", "Opérateur démo"),
                   "reason": f"Lancement du job {job['name']}", "before": self.configuration(), "config": config}
             self.journal.append(ce); self._load_config(config); self.audit.append(ce)
-            first = cfg.passes[0]
-            direction = first.direction if first.direction != "auto" else "forward"
-            self.direction = 1 if direction == "forward" else -1
-            self.travel = cfg.start_m if self.direction == 1 else cfg.end_m
-            self.pass_number = 0
-            changes = {"status": "EN_COURS", "started_at": now, "finished_at": None,
-                       "current_pass_index": 0, "progress_pct": 0.0, "message": "Simulation en cours",
-                       "results": self._empty_job_results(job["config"])}
-            self.active_job_id = job_id; self.running = True
+            preparation = {"validation": validation, "plan": validation["planned_passes"],
+                           "results": self._empty_job_results(job["config"]), "started_at": now,
+                           "finished_at": None, "progress_pct": 0.0,
+                           "machine_before_job": job["machine_before_job"]}
+            prepare_event = {"type": "job_state", "at": now, "job_id": job_id, "changes": preparation}
+            self.journal.append(prepare_event); self._apply_job_event(prepare_event)
+            self.active_job_id = job_id
+            self.running = True
+            self._schedule_pass_positioning(job, 0)
+            changes = {}
         elif action == "pause":
-            if job.get("status") != "EN_COURS":
-                raise ValueError("Seul un job en cours peut être mis en pause.")
+            if job.get("status") not in ("EN_COURS", "EN_DEPLACEMENT"):
+                raise ValueError("Seul un job actif peut être mis en pause.")
             self.running = False
             changes = {"status": "EN_PAUSE", "message": "Job en pause"}
         elif action == "resume":
             if job.get("status") != "EN_PAUSE":
                 raise ValueError("Seul un job en pause peut être repris.")
             self.running = True; self.active_job_id = job_id
-            changes = {"status": "EN_COURS", "message": "Simulation reprise"}
+            status = "EN_DEPLACEMENT" if job.get("positioning_target_m") is not None else "EN_COURS"
+            changes = {"status": status, "message": "Simulation reprise"}
         elif action == "stop":
             self.running = False
+            self._restore_machine_after_job(job)
             changes = {"status": "ARRETE", "finished_at": now, "message": "Job arrêté par l'opérateur"}
         else:
             raise ValueError("Action de job inconnue.")
-        event = {"type": "job_state", "at": now, "job_id": job_id, "changes": changes}
-        self.journal.append(event); self._apply_job_event(event); self.revision += 1
+        if changes:
+            event = {"type": "job_state", "at": now, "job_id": job_id, "changes": changes}
+            self.journal.append(event); self._apply_job_event(event)
+        self.revision += 1
         return self.jobs[job_id]
 
     def _apply_job_record(self, record: dict):
@@ -336,7 +448,7 @@ class Engine:
         index = int(job.get("current_pass_index", 0))
         stats = job["results"]["passes"][index]
         target = float(step.get("target_tonnage_t") or 0.0)
-        complete = (target > 0 and stats["deposited_tonnage_t"] >= target - 1e-6) or bounced
+        complete = (target > 0 and stats["deposited_tonnage_t"] >= target - 1e-6) or (target <= 0 and bounced)
         if not complete:
             return
         stats["status"] = "TERMINE"
@@ -344,28 +456,14 @@ class Engine:
         now = time.time()
         if next_index >= len(job["config"]["passes"]):
             self.running = False
+            self._restore_machine_after_job(job)
             event = {"type": "job_state", "at": now, "job_id": job["id"],
                      "changes": {"status": "TERMINE", "finished_at": now, "current_pass_index": index,
-                                  "progress_pct": 100.0, "message": "Simulation terminée"}}
+                                  "progress_pct": 100.0, "positioning_target_m": None,
+                                  "distance_remaining_m": 0.0, "message": "Simulation terminée"}}
             self.journal.append(event); self._apply_job_event(event)
             return
-        next_step = job["config"]["passes"][next_index]
-        job["current_pass_index"] = next_index
-        self.machine_config.product_id = next_step["product_id"]
-        if next_step.get("lane") in ("north", "south"):
-            self.machine_config.lane = next_step["lane"]
-        direction = next_step.get("direction")
-        if direction == "forward":
-            self.direction = 1; self.travel = self.machine_config.travel_min_m
-        elif direction == "backward":
-            self.direction = -1; self.travel = self.machine_config.travel_max_m
-        else:
-            self.direction *= -1
-            self.travel = self.machine_config.travel_min_m if self.direction == 1 else self.machine_config.travel_max_m
-        job["message"] = f"Passage {next_index+1}/{len(job['config']['passes'])}"
-        event = {"type": "job_state", "at": now, "job_id": job["id"],
-                 "changes": {"current_pass_index": next_index, "message": job["message"]}}
-        self.journal.append(event); self._apply_job_event(event)
+        self._schedule_pass_positioning(job, next_index)
 
     def list_jobs(self) -> list[dict]:
         return sorted(self.jobs.values(), key=lambda j: j.get("created_at", 0), reverse=True)
@@ -384,10 +482,12 @@ class Engine:
             lane = "south" if lane == "north" else "north"
         sign = 1 if lane == "north" else -1
         slew = sign*abs(m.slew_deg) + m.oscillation_deg*math.sin(self.simulation_time/90)
+        active_job = self.jobs.get(self.active_job_id) if self.active_job_id else None
+        state = "POSITIONING" if active_job and active_job.get("status") == "EN_DEPLACEMENT" else "STACKING" if self.running else "STOPPED"
         return {"machine_id": "STK-001", "acquired_at": acquired_at, "sequence": self.sequence,
                 "travel_m": self.travel, "slew_deg": slew, "luff_deg": m.luff_deg,
                 "boom_extension_m": 0., "direction": self.direction, "lane": lane,
-                "state": "STACKING" if self.running else "STOPPED", "quality": "SIMULATED",
+                "state": state, "quality": "SIMULATED",
                 "plc_connection": "SIMULATOR", "position_quality": "SIMULATED"}
 
     def _raw_scan(self, pose: dict) -> dict:
@@ -436,7 +536,11 @@ class Engine:
                 self.error = "Hauteur limite de démonstration atteinte (18 m). Arrêt du simulateur."
                 self.running = False
             else:
-                self._acquire(dt)
+                active_job = self._active_job()
+                if active_job and active_job.get("status") == "EN_DEPLACEMENT":
+                    self._advance_job_positioning(dt)
+                else:
+                    self._acquire(dt)
         # Live records have already been accepted. Drain exact outstanding IDs concurrently.
         if self.online:
             for rid in list(self.pending[:2]):
@@ -473,14 +577,19 @@ class Engine:
             if remaining > 0:
                 mass = min(mass, remaining)
         dep = None
+        deposit_bounds = None
+        if job_pair:
+            plan = job_pair[0].get("plan", [])[int(job_pair[0].get("current_pass_index", 0))]
+            deposit_bounds = (float(plan["x0"]), float(plan["x1"]), float(plan["y0"]), float(plan["y1"]))
         if mass > 0:
             if m.deposition_profile == "mound":
                 # Use acquisition-side truth, not the possibly disconnected central
                 # projection. Journal the increments so LIVE/BACKFILL stay additive.
                 dep = deposit_mound(float(tip[0]), float(tip[1]), mass, product,
-                                    self.truth.heights, m.repose_angle_deg)
+                                    self.truth.heights, m.repose_angle_deg, deposit_bounds)
             else:
-                dep = deposit_footprint(float(tip[0]), float(tip[1]), mass, product, m.footprint_sigma_m)
+                dep = deposit_footprint(float(tip[0]), float(tip[1]), mass, product,
+                                        m.footprint_sigma_m, deposit_bounds)
         record = {"id": f"{self.instance}-{self.sequence}", "acquisition_instance": self.instance,
                   "stream_id": "STK-001/POSE+SCAN+DEPOSIT", "sequence": self.sequence,
                   "acquired_at": now, "simulation_time_s": self.simulation_time,

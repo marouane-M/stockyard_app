@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 import numpy as np
 from .models import Selection
+from .stratigraphy import DepositStratigraphy
 
 CELL = 2.0
 NX, NY = 180, 54
@@ -22,9 +23,13 @@ def overlap(selection: Selection) -> np.ndarray:
     return np.outer(wy, wx).ravel()
 
 
-def deposit_footprint(x: float, y: float, mass: float, product: dict, sigma: float) -> dict:
+def deposit_footprint(x: float, y: float, mass: float, product: dict, sigma: float,
+                      bounds: tuple[float, float, float, float] | None = None) -> dict:
     # Truncated Gaussian on the correct lane, renormalized: no mass lost at its edge.
     eligible = (np.abs(YY) >= 14) & (np.abs(YY) <= 48) & ((YY > 0) == (y > 0))
+    if bounds is not None:
+        x0, x1, y0, y1 = bounds
+        eligible &= (XX >= x0) & (XX <= x1) & (YY >= y0) & (YY <= y1)
     d2 = (XX-x)**2 + (YY-y)**2
     w = np.exp(-d2/(2*sigma*sigma)) * eligible * (d2 < (3*sigma)**2)
     indices = np.flatnonzero(w.ravel() > 0)
@@ -42,6 +47,10 @@ class Inventory:
         self.events: list[dict] = []
         self.heights = np.zeros(NX*NY)
         self.product_volume: dict[str, np.ndarray] = {}
+        # Latest deposited product per cell represents the exposed/top material.
+        # Per-product volumes remain additive, so underlying products are not lost.
+        self.top_product: list[str | None] = [None] * (NX * NY)
+        self.stratigraphy = DepositStratigraphy(NX * NY)
         self.seen: set[str] = set()
 
     def integrate(self, record: dict):
@@ -56,6 +65,10 @@ class Inventory:
         self.heights[indices] += volumes / AREA
         p = dep["product"]["id"]
         self.product_volume.setdefault(p, np.zeros(NX*NY))[indices] += volumes
+        for cell, volume in zip(indices.tolist(), volumes.tolist()):
+            if volume > 0:
+                self.top_product[cell] = p
+                self.stratigraphy.add(cell, p, volume / AREA, record["sequence"], record["acquired_at"])
         self.events.append({"id": record["id"], "sequence": record["sequence"],
                             "acquired_at": record["acquired_at"], "lot": record["lot"],
                             "machine_id": "STK-001", "deposit": dep})
@@ -72,11 +85,14 @@ class Inventory:
 
     def grid(self, products: list[dict]) -> dict:
         ids = [p["id"] for p in products]
-        layers = np.stack([self.product_volume.get(i, np.zeros(NX*NY)) for i in ids])
-        colors = np.argmax(layers, axis=0)
+        index_by_id = {product_id: index for index, product_id in enumerate(ids)}
+        colors = np.array([index_by_id.get(product_id, -1) if product_id else -1
+                           for product_id in self.top_product], dtype=int)
         colors[self.heights <= 0] = -1
         return {"nx": NX, "ny": NY, "cell_m": CELL, "x0": X0, "y0": Y0,
-                "heights_m": np.round(self.heights, 5).tolist(), "product_indices": colors.tolist()}
+                "heights_m": np.round(self.heights, 5).tolist(), "product_indices": colors.tolist(),
+                "surface_basis": "SIMULATED_DEPOSIT_LEDGER",
+                "stratigraphy": self.stratigraphy.packed(ids, cell_area_m2=AREA)}
 
     def report(self, selection: Selection, measured: np.ndarray | None = None) -> dict:
         fraction = overlap(selection)

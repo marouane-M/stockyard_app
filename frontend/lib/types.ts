@@ -1,6 +1,7 @@
 export type Vec3 = [number, number, number];
 export type Mode = "2d" | "3d";
 export type Area = { x0: number; x1: number; y0: number; y1: number };
+export type JobArea = Area & { source: "form" | "map" | "suggestion" };
 export type MachineConfig = {
   travel_min_m: number; travel_max_m: number; speed_m_s: number; flow_t_h: number;
   time_scale: number; slew_deg: number; luff_deg: number; oscillation_deg: number;
@@ -27,7 +28,14 @@ export type Pose = {
   slew_deg: number; luff_deg: number; boom_extension_m: number; direction: number;
   lane: "north" | "south"; state: string; quality: string; plc_connection: string; position_quality: string;
 };
-export type Grid = { nx: number; ny: number; cell_m: number; x0: number; y0: number; heights_m: number[]; product_indices: number[] };
+export type GridStratigraphyProduct = { product_id: string; volume_m3: number; cell_layers: number; max_top_m: number };
+export type GridStratigraphy = {
+  version: string; cell_indices: number[]; layer_offsets: number[]; product_indices: number[];
+  bottom_m: number[]; top_m: number[]; first_sequences: number[]; last_sequences: number[];
+  cell_count: number; layer_count: number; max_layers: number; products: GridStratigraphyProduct[];
+};
+export type Grid = { nx: number; ny: number; cell_m: number; x0: number; y0: number; heights_m: number[];
+  product_indices: number[]; surface_basis?: string; stratigraphy?: GridStratigraphy };
 export type InventoryRow = {
   product_id: string; name: string; color: string; volume_m3: number; tonnage_t: number;
   density_t_m3: number; bpl_pct: number; co2_pct: number; mgo_pct: number; sio2_pct: number;
@@ -47,13 +55,28 @@ export type SimulationPassConfig = {
 };
 export type SimulationJobConfig = {
   name: string; storage_type: "mound" | "gaussian" | "longitudinal" | "alternating" | "conical";
-  start_m: number; end_m: number; lane: "north" | "south"; travel_speed_m_s: number; flow_t_h: number;
-  time_scale: number; reset_before_start: boolean; passes: SimulationPassConfig[];
+  placement_mode: "adjacent" | "layered";
+  start_m: number; end_m: number; lane: "north" | "south"; area: JobArea | null; max_height_m: number;
+  travel_speed_m_s: number; flow_t_h: number; time_scale: number; reset_before_start: boolean; passes: SimulationPassConfig[];
+};
+export type JobValidationIssue = { code: string; title: string; message: string; details: Record<string, unknown> };
+export type PlannedJobPass = {
+  index: number; product_id: string; product_name: string; color: string; target_tonnage_t: number; target_volume_m3: number;
+  direction: SimulationPassConfig["direction"]; lane: SimulationPassConfig["lane"]; x0: number; x1: number; y0: number; y1: number;
+  estimated_z0_m: number; estimated_z1_m: number; estimated_height_m: number;
+};
+export type JobValidation = {
+  valid: boolean; status: "VALIDE" | "REFUSE"; area: JobArea; placement_mode: "adjacent" | "layered";
+  errors: JobValidationIssue[]; warnings: JobValidationIssue[]; occupied_products: { product_id: string; name: string; color: string; volume_m3: number; tonnage_t: number }[];
+  suggested_area: (JobArea & { required_length_m?: number }) | null; planned_passes: PlannedJobPass[];
+  metrics: { length_m: number; width_m: number; selected_area_m2: number; occupied_area_m2: number; existing_volume_m3: number; requested_tonnage_t: number; requested_volume_m3: number; theoretical_capacity_m3: number; free_capacity_m3: number; estimated_max_height_m: number; max_height_m: number; estimated_duration_s: number; fill_factor: number };
+  summary: string; basis: string;
 };
 export type SimulationJob = {
-  id: string; name: string; status: "PRET" | "EN_COURS" | "EN_PAUSE" | "TERMINE" | "ARRETE" | "ERREUR";
+  id: string; name: string; status: "PRET" | "REFUSE" | "EN_DEPLACEMENT" | "EN_POSITIONNEMENT" | "EN_COURS" | "EN_PAUSE" | "TERMINE" | "ARRETE" | "ERREUR";
   created_at: number; started_at: number | null; finished_at: number | null; operator: string; reason: string;
-  config: SimulationJobConfig; current_pass_index: number; progress_pct: number; message: string;
+  config: SimulationJobConfig; validation?: JobValidation; plan?: PlannedJobPass[]; current_pass_index: number; progress_pct: number; message: string;
+  positioning_target_m?: number | null; distance_remaining_m?: number;
   results: {
     total_tonnage_t: number; total_volume_m3: number; max_height_m: number; duration_s: number; distance_m: number; target_tonnage_t?: number;
     products: Record<string, { product_id: string; name: string; color: string; tonnage_t: number; volume_m3: number }>;
@@ -93,5 +116,6 @@ export type AuditEvent = {
 export type Layer = "map" | "piles" | "machine" | "scanner" | "points" | "measured" | "grid" | "labels";
 export type Layers = Record<Layer, boolean>;
 export type Picked = "machine" | "scanner" | "pile";
+export type ProductFilterMode = "isolate" | "dim";
 export type SelectionTool = "navigate" | "interval" | "rectangle";
 export type LaneScope = "all" | "north" | "south";

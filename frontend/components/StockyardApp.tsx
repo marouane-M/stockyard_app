@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { clock, format } from "@/lib/api";
 import { FULL_AREA, useStockyard } from "@/lib/useStockyard";
-import type { Area, Frame, LaneScope, Layer, Layers, Mode, SelectionTool } from "@/lib/types";
+import type { Area, Frame, LaneScope, Layer, Layers, Mode, ProductFilterMode, SelectionTool } from "@/lib/types";
 import Icon from "./Icon";
 import Viewport from "./Viewport";
 import ConfigModal from "./ConfigModal";
@@ -24,6 +24,12 @@ const layerLabels: { id: Layer; label: string }[] = [
   { id: "labels", label: "Repères & étiquettes" },
 ];
 
+
+const jobStatusLabels: Record<string,string> = {
+  PRET:"Prêt", REFUSE:"Refusé", EN_DEPLACEMENT:"En déplacement", EN_POSITIONNEMENT:"En positionnement",
+  EN_COURS:"En cours", EN_PAUSE:"En pause", TERMINE:"Terminé", ARRETE:"Arrêté", ERREUR:"Erreur"
+};
+
 function isFullArea(area: Area) {
   return area.x0 === 0 && area.x1 === 360 && area.y0 === -54 && area.y1 === 54;
 }
@@ -39,18 +45,32 @@ export default function StockyardApp() {
   const [configTab, setConfigTab] = useState("machine");
   const [centerKey, setCenterKey] = useState(0);
   const [toast, setToast] = useState("");
+  const [jobArea, setJobArea] = useState<Area | null>(null);
+  const [jobAreaToken, setJobAreaToken] = useState(0);
   const [clockNow, setClockNow] = useState(Date.now());
   const [layers, setLayers] = useState<Layers>({ map: true, piles: true, machine: true, scanner: true, points: false, measured: false, grid: false, labels: true });
+  const [productFilter, setProductFilter] = useState<string[]>([]);
+  const [productFilterMode, setProductFilterMode] = useState<ProductFilterMode>("dim");
+  const [productFilterInitialized, setProductFilterInitialized] = useState(false);
   const full = isFullArea(area);
   const blocked = !api || store.busy || until !== null;
   const connectionLabels = { connecting: "Connexion…", live: "Connecté au central", offline: "Central déconnecté", stale: "Données figées" };
 
   useEffect(() => { const t = setInterval(() => setClockNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+  useEffect(() => {
+    const ids=frame?.config.products.map(product=>product.id)??[];
+    if(ids.length && !productFilterInitialized){setProductFilter(ids);setProductFilterInitialized(true);}
+  }, [frame?.config.products, productFilterInitialized]);
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(""), 6000); return () => clearTimeout(t); }, [toast]);
 
   const openConfig = (section = "machine") => { setConfigTab(section); setModal("config"); };
   const select = (selected: Area) => { setArea(selected); setTab("selection"); setTool("navigate"); };
   const clearSelection = () => { setArea({ ...FULL_AREA }); setTool("navigate"); setTab("selection"); };
+  const createJobFromSelection = () => {
+    if (full) { setToast("Sélectionnez d'abord un intervalle ou un rectangle dans une seule base de stockage."); setMode("2d"); setTool("interval"); return; }
+    setJobArea({ ...area }); setJobAreaToken(token => token + 1); setTab("simulation");
+    setToast("La zone sélectionnée a été transférée dans le formulaire du job.");
+  };
   const setView = (view: Mode) => { setMode(view); if (view === "3d") setTool("navigate"); };
   const chooseTool = (value: SelectionTool) => { setTool(value); if (value !== "navigate") setMode("2d"); };
   const chooseScope = (value: LaneScope) => {
@@ -88,7 +108,13 @@ export default function StockyardApp() {
           <button className={tab === "selection" ? "active" : ""} onClick={() => setTab("selection")}><Icon name="select" size={16} />Inventaire sélection</button>
         </nav></section>
         <section className="panel card"><div className="panel-title"><span className="eyebrow">COUCHES</span><button onClick={() => setLayers({ map: true, piles: true, machine: true, scanner: true, points: false, measured: false, grid: false, labels: true })}>Défaut</button></div>{layerLabels.map(layer => <label className="layer-toggle" key={layer.id}><input type="checkbox" checked={layers[layer.id]} onChange={e => setLayers({ ...layers, [layer.id]: e.target.checked })} /><span>{layer.label}</span></label>)}</section>
-        <section className="panel card metrics"><span className="eyebrow">ÉTAT DU JOB</span><strong>{frame?.active_job?.name ?? "Aucun job actif"}</strong><small>{frame?.active_job ? `${frame.active_job.status} · ${format(frame.active_job.progress_pct, 0)} %` : "Créez un scénario puis lancez-le"}</small><div className="progress"><b style={{ width: `${Math.max(0, Math.min(100, frame?.active_job?.progress_pct ?? 0))}%` }} /></div></section>
+        <section className="panel card product-filter-panel"><div className="panel-title"><span className="eyebrow">FILTRE PRODUITS 3D</span><button onClick={()=>setProductFilter(frame?.config.products.map(p=>p.id)??[])}>Tous</button></div>
+          <label className="field compact"><span>Affichage des produits non sélectionnés</span><select value={productFilterMode} onChange={e=>setProductFilterMode(e.target.value as ProductFilterMode)}><option value="dim">Transparents</option><option value="isolate">Masqués</option></select></label>
+          {(frame?.config.products??[]).map(product=><label className="product-filter-row" key={product.id}><input type="checkbox" checked={productFilter.includes(product.id)} onChange={e=>setProductFilter(current=>e.target.checked?[...new Set([...current,product.id])]:current.filter(id=>id!==product.id))}/><i className="product-dot" style={{background:product.color}}/><span>{product.name}</span></label>)}
+          <div className="filter-actions"><button onClick={()=>setProductFilter([])}>Aucun</button><button onClick={()=>setProductFilter(frame?.config.products.map(p=>p.id)??[])}>Tout afficher</button></div>
+          {!!frame?.grid?.stratigraphy?.layer_count&&<p className="inspector-help">{frame.grid.stratigraphy.layer_count} couche(s) matière dans {frame.grid.stratigraphy.cell_count} cellule(s). Choisissez <strong>Masqués</strong> pour révéler un produit enfoui.</p>}
+        </section>
+        <section className="panel card metrics"><span className="eyebrow">ÉTAT DU JOB</span><strong>{frame?.active_job?.name ?? "Aucun job actif"}</strong><small>{frame?.active_job ? `${jobStatusLabels[frame.active_job.status]??frame.active_job.status} · ${format(frame.active_job.progress_pct, 0)} %` : "Créez un scénario puis lancez-le"}</small><div className="progress"><b style={{ width: `${Math.max(0, Math.min(100, frame?.active_job?.progress_pct ?? 0))}%` }} /></div></section>
         <section className="panel card metrics"><span className="eyebrow">INVENTAIRE GLOBAL</span><strong>{format(frame?.totals.total_tonnage_t, 0)} t</strong><small>{format(frame?.totals.total_volume_m3, 0)} m³ · hauteur max. {format(frame?.totals.max_height_m, 2)} m</small></section>
         <section className="panel card"><span className="eyebrow">CONFIGURATION</span><button className="text-button" onClick={() => openConfig("machine")} disabled={blocked}><Icon name="settings" size={15} />Machine & stockage</button><button className="text-button" onClick={() => openConfig("products")} disabled={blocked}><Icon name="layers" size={15} />Produits & couleurs</button><button className="text-button" onClick={() => setModal("empty")} disabled={blocked}><Icon name="reset" size={15} />Parc vide</button></section>
       </aside>
@@ -101,14 +127,14 @@ export default function StockyardApp() {
             {mode === "2d" && <select className="scope-select" aria-label="Parc à sélectionner" value={scope} onChange={e => chooseScope(e.target.value as LaneScope)}><option value="all">Les deux parcs</option><option value="south">Parc sud</option><option value="north">Parc nord</option></select>}
             {mode === "2d" && !full && <button className="tool-button" onClick={clearSelection}><Icon name="reset" size={16} />Effacer la sélection</button>}
             <button className="icon-button recenter" aria-label="Recentrer la vue" title="Recentrer la vue" onClick={() => setCenterKey(k => k + 1)}><Icon name="center" /></button></div>
-          <Viewport frame={frame} mode={mode} tool={tool} scope={scope} layers={layers} area={full ? null : area} map={store.map} apiBase={api?.base ?? ""} onArea={select} onPick={kind => setTab(kind === "scanner" ? "scanner" : kind === "machine" ? "pilot" : "selection")} onStart={() => void store.command("start")} centerKey={centerKey} disabled={blocked || connection !== "live"} />
+          <Viewport frame={frame} mode={mode} tool={tool} scope={scope} layers={layers} area={full ? null : area} map={store.map} apiBase={api?.base ?? ""} productFilter={productFilter} productFilterMode={productFilterMode} onArea={select} onPick={kind => setTab(kind === "scanner" ? "scanner" : kind === "machine" ? "pilot" : "selection")} onStart={() => void store.command("start")} centerKey={centerKey} disabled={blocked || connection !== "live"} />
           <div className="timeline-bar"><Icon name="clock" size={15} /><span>Relecture</span><input aria-label="Relecture des acquisitions" type="range" min={1} max={Math.max(1, live?.sequence ?? 1)} value={until ?? Math.max(1, live?.sequence ?? 1)} disabled={!live?.sequence} onChange={e => store.setUntil(Number(e.target.value))} /><span className="timeline-number">#{until ?? frame?.machine.sequence ?? 0}</span><button className={`live-button ${until === null ? "active" : ""}`} onClick={() => store.setUntil(null)}><i className="dot" />{until === null ? "DIRECT" : "Revenir en direct"}</button></div>
         </section>
 
-        {tab === "simulation" && <SimulationPanel api={api} frame={frame} disabled={blocked || connection !== "live"} onFrame={store.merge} onError={store.setError} />}
+        {tab === "simulation" && <SimulationPanel api={api} frame={frame} disabled={blocked || connection !== "live"} onFrame={store.merge} onError={store.setError} selectedArea={jobArea} selectionToken={jobAreaToken} />}
         {tab === "pilot" && <section className="panel card inspector-wide"><header className="section-title"><div><span className="eyebrow">PILOTAGE</span><h3>STK-001</h3></div><span className="pill neutral">Commandes du simulateur uniquement</span></header><div className="control-buttons"><button className="button primary" data-testid="start-machine" disabled={blocked || frame?.running || connection !== "live"} onClick={() => void store.command("start")}><Icon name="play" size={16} />Démarrer</button><button className="button stop-button" data-testid="stop-machine" disabled={blocked || !frame?.running} onClick={() => void store.command("stop")}><Icon name="stop" size={15} />Arrêter</button></div><div className="field-grid"><label className="field"><span>Produit à déposer</span><select disabled={blocked} value={frame?.config.machine.product_id ?? ""} onChange={e => void updateMachine({ product_id: e.target.value, auto_products: false }, "Sélection manuelle du prochain produit")}><option value="" disabled>Chargement…</option>{frame?.config.products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><label className="field"><span>Accélération du temps</span><select aria-label="Accélération du temps" disabled={blocked} value={frame?.config.machine.time_scale ?? 300} onChange={e => void updateMachine({ time_scale: Number(e.target.value) }, "Ajustement de la vitesse de démonstration")}>{[1, 50, 150, 300, 600, ...(frame && ![1, 50, 150, 300, 600].includes(frame.config.machine.time_scale) ? [frame.config.machine.time_scale] : [])].map(n => <option value={n} key={n}>× {n}</option>)}</select></label></div><label className="layer-toggle"><input type="checkbox" disabled={blocked} checked={frame?.config.machine.auto_products ?? true} onChange={e => void updateMachine({ auto_products: e.target.checked }, "Modification de l'alternance des produits")} /><span>Alterner les produits à chaque passage</span></label><div className="active-product"><i className="product-dot" style={{ background: frame?.active_product?.color ?? "#64748b" }} /><span>{frame?.active_product.name ?? "—"}</span><small>En cours</small></div><dl className="properties"><dt>Translation</dt><dd>{format(frame?.machine.travel_m)} m</dd><dt>Orientation</dt><dd>{format(frame?.machine.slew_deg)}°</dd><dt>Inclinaison</dt><dd>{format(frame?.machine.luff_deg)}°</dd><dt>Débit du convoyeur</dt><dd>{format(frame?.config.machine.flow_t_h, 0)} t/h</dd><dt>Vitesse sur rail</dt><dd>{format(frame?.config.machine.speed_m_s, 3)} m/s</dd><dt>Passage / direction</dt><dd>{(frame?.pass_number ?? 0) + 1} / {frame?.machine.direction === -1 ? "retour" : "aller"}</dd></dl><button className="text-button" onClick={() => openConfig("machine")} disabled={blocked}>Réglages de la machine <Icon name="arrow" size={14} /></button></section>}
         {tab === "scanner" && <section className="panel card inspector-wide"><header className="section-title"><div><span className="eyebrow">SCANNER</span><h3>LIDAR-001</h3></div><span className="pill neutral">Source simulée</span></header><div className="status-card"><i className={`dot ${frame?.scanner.acquiring ? "teal" : "gray"}`} /><strong>{frame?.scanner.acquiring ? "Acquisition active" : "Acquisition à l'arrêt"}</strong><small>Monté sur la flèche</small></div><dl className="properties"><dt>Fréquence</dt><dd>{format(frame?.scanner.rate_hz, 0)} Hz</dd><dt>Dernier balayage reçu</dt><dd>{clock(frame?.scanner.last_acquired_at)}</dd><dt>Séquence reçue</dt><dd>#{frame?.scanner.sequence ?? "—"}</dd><dt>Retours retenus</dt><dd>{frame?.scanner.valid_count ?? 0} / {frame?.scanner.total_count ?? 0}</dd><dt>Champ de vision</dt><dd>{format(frame?.config.scanner.fov_deg, 0)}°</dd><dt>Tampon d'acquisition</dt><dd>{frame?.communication.pending_records ?? 0} acquisition(s)</dd></dl><div className="control-buttons"><button className="button primary" disabled={!api} onClick={() => setModal("scan")}><Icon name="table" size={16} />Mesures & corrections</button><button className="button" disabled={blocked} onClick={() => openConfig("scanner")}><Icon name="settings" size={16} />Paramétrer le scanner</button></div><p className="inspector-help">Mesures transformées avec la pose à l'instant d'acquisition. Les données brutes ne sont jamais écrasées.</p></section>}
-        {tab === "selection" && <section className="panel card inspector-wide"><header className="section-title"><div><span className="eyebrow">SÉLECTION 2D</span><h3>{full ? "Emprise complète" : "Zone sélectionnée"}</h3></div><span className="pill amber">Inventaire simulé</span></header><div className="selection-hero"><strong>{format(report?.total_tonnage_t)} <small>t</small></strong><span>{format(report?.total_volume_m3)} m³ de matière modélisée</span></div><dl className="properties"><dt>Intervalle longitudinal</dt><dd>{format(area.x0)} – {format(area.x1)} m</dd><dt>Emprise latérale</dt><dd>{format(area.y0)} – {format(area.y1)} m</dd><dt>Surface de la sélection</dt><dd>{format(report?.area_m2, 0)} m²</dd><dt>Hauteur maximale</dt><dd>{format(report?.max_height_m, 2)} m</dd><dt>Produits / lots</dt><dd>{report?.products.length ?? 0} / {report?.lots.length ?? 0}</dd><dt>Volume LiDAR partiel</dt><dd>{format(report?.observed_lidar_volume_m3)} m³</dd></dl><div className="control-buttons"><button className="button" onClick={() => chooseTool("interval")}><Icon name="select" size={16} />Sélectionner en 2D</button>{!full && <button className="button" onClick={clearSelection}><Icon name="reset" size={16} />Effacer la sélection</button>}</div><p className="inspector-help">Le détail des produits, tonnages et analyses de cette zone se trouve dans le tableau ci-dessous.</p></section>}
+        {tab === "selection" && <section className="panel card inspector-wide"><header className="section-title"><div><span className="eyebrow">SÉLECTION 2D</span><h3>{full ? "Emprise complète" : "Zone sélectionnée"}</h3></div><span className="pill amber">Inventaire simulé</span></header><div className="selection-hero"><strong>{format(report?.total_tonnage_t)} <small>t</small></strong><span>{format(report?.total_volume_m3)} m³ de matière modélisée</span></div><dl className="properties"><dt>Intervalle longitudinal</dt><dd>{format(area.x0)} – {format(area.x1)} m</dd><dt>Emprise latérale</dt><dd>{format(area.y0)} – {format(area.y1)} m</dd><dt>Surface de la sélection</dt><dd>{format(report?.area_m2, 0)} m²</dd><dt>Hauteur maximale</dt><dd>{format(report?.max_height_m, 2)} m</dd><dt>Produits / lots</dt><dd>{report?.products.length ?? 0} / {report?.lots.length ?? 0}</dd><dt>Volume LiDAR partiel</dt><dd>{format(report?.observed_lidar_volume_m3)} m³</dd></dl><div className="control-buttons"><button className="button" onClick={() => chooseTool("interval")}><Icon name="select" size={16} />Sélectionner en 2D</button>{!full&&<button className="button primary" onClick={createJobFromSelection}><Icon name="plus" size={16}/>Créer un job dans cette zone</button>}{!full && <button className="button" onClick={clearSelection}><Icon name="reset" size={16} />Effacer la sélection</button>}</div><p className="inspector-help">Cliquez directement sur un produit dans la vue 2D ou 3D pour sélectionner sa cellule. Le détail des produits, couches, tonnages et analyses se trouve dans le tableau ci-dessous.</p></section>}
       </div>
 
       <InventoryTable report={report} area={area} onArea={select} onExport={() => void exportReport()} historical={until !== null} />

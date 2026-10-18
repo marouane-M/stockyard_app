@@ -1,8 +1,9 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { Area, Frame, Grid, LaneScope, Layers, MapManifest, Mode, Picked, SelectionTool } from "@/lib/types";
+import type { Area, Frame, Grid, LaneScope, Layers, MapManifest, Mode, Picked, ProductFilterMode, SelectionTool } from "@/lib/types";
 
 import { buildStockpileSurface, sampleStockpileHeight, SURFACE_OFFSET_M, writeInterpolatedHeights } from "./stockpileGeometry";
+import { buildStratifiedGeometry } from "./stratifiedGeometry";
 
 const rad = THREE.MathUtils.degToRad;
 function dispose(object: THREE.Object3D) {
@@ -69,7 +70,16 @@ export class YardScene {
   private scannerVisual = new THREE.Group();
   private fan = new THREE.Mesh(new THREE.BufferGeometry(),new THREE.MeshBasicMaterial({color:0x16b5ba,transparent:true,opacity:.12,side:THREE.DoubleSide,depthWrite:false}));
   private beam = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color:0x40ede3,transparent:true,opacity:.9}));
-  private surface = new THREE.Mesh(new THREE.BufferGeometry(),new THREE.MeshStandardMaterial({vertexColors:true,roughness:.88,metalness:0,side:THREE.DoubleSide,flatShading:false}));
+  private surface: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial | THREE.MeshStandardMaterial[]> = new THREE.Mesh(
+    new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({color:0xb9c7c1,roughness:.9,metalness:0,side:THREE.DoubleSide,flatShading:false})
+  );
+  private strata: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial | THREE.MeshStandardMaterial[]> = new THREE.Mesh(
+    new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({color:0xb9c7c1,roughness:.92,metalness:0,side:THREE.DoubleSide,flatShading:false})
+  );
+  private surfaceMaterials: THREE.MeshStandardMaterial[] = [];
+  private productMaterialIds: string[] = [];
+  private visibleProducts = new Set<string>();
+  private productFilterMode: ProductFilterMode = "dim";
   private scannerPointTexture = roundPointTexture();
   private points = new THREE.Points(new THREE.BufferGeometry(),new THREE.PointsMaterial({
     color:0x25cfc4,size:.22,sizeAttenuation:true,transparent:true,opacity:.28,depthWrite:false,alphaTest:.04
@@ -130,8 +140,9 @@ export class YardScene {
     this.controls=new OrbitControls(this.camera,this.renderer.domElement);
     this.configureControls(); this.center();
     this.buildGround();
-    this.root.add(this.map,this.labels,this.gridLines,this.machine,this.surface,this.points,this.observed,this.stream,this.selection);
+    this.root.add(this.map,this.labels,this.gridLines,this.machine,this.surface,this.strata,this.points,this.observed,this.stream,this.selection);
     this.surface.receiveShadow=true; this.surface.castShadow=true; this.surface.userData.kind="pile";
+    this.strata.receiveShadow=true; this.strata.castShadow=true; this.strata.userData.kind="pile"; this.strata.userData.hasData=false; this.strata.renderOrder=1;
     (this.points.material as THREE.PointsMaterial).map=this.scannerPointTexture;
     (this.points.material as THREE.PointsMaterial).needsUpdate=true;
     this.points.renderOrder=2;
@@ -297,6 +308,61 @@ export class YardScene {
     (this.stream.material as THREE.PointsMaterial).color.set(frame.active_product.color);
     this.stream.visible=frame.running && frame.config.machine.flow_t_h>0 && frame.mode==="LIVE" && this.layers.machine && frame.communication.online;
   }
+  private ensureSurfaceMaterials(frame:Frame){
+    const ids=frame.config.products.map(product=>`${product.id}:${product.color}`);
+    if(ids.join("|")===this.productMaterialIds.join("|"))return;
+    for(const material of this.surfaceMaterials)material.dispose();
+    this.surfaceMaterials=frame.config.products.map(product=>new THREE.MeshStandardMaterial({
+      color:product.color,roughness:.9,metalness:0,side:THREE.DoubleSide,flatShading:false,
+      transparent:true,opacity:1,depthWrite:true,polygonOffset:true,polygonOffsetFactor:1,polygonOffsetUnits:1
+    }));
+    this.surfaceMaterials.push(new THREE.MeshStandardMaterial({
+      color:0xb9c7c1,roughness:.96,metalness:0,side:THREE.DoubleSide,transparent:true,opacity:.18,depthWrite:false
+    }));
+    this.productMaterialIds=ids;
+    this.surface.material=this.surfaceMaterials;
+    this.strata.material=this.surfaceMaterials;
+    if(this.visibleProducts.size===0)for(const product of frame.config.products)this.visibleProducts.add(product.id);
+    this.applyProductFilter();
+  }
+  private applyProductFilter(){
+    const configured=this.productMaterialIds.map(value=>value.split(":")[0]);
+    const all=this.visibleProducts.size===configured.length;
+    this.surfaceMaterials.forEach((material,index)=>{
+      const productId=configured[index];
+      if(!productId){material.visible=true;material.opacity=.18;material.depthWrite=false;return;}
+      const selected=all||this.visibleProducts.has(productId);
+      if(this.productFilterMode==="isolate"){
+        material.visible=selected;material.opacity=1;material.depthWrite=selected;
+      }else{
+        material.visible=true;material.opacity=selected?1:.08;material.depthWrite=selected;
+      }
+      material.needsUpdate=true;
+    });
+  }
+  setProductFilter(productIds:string[],mode:ProductFilterMode){
+    this.visibleProducts=new Set(productIds);this.productFilterMode=mode;this.applyProductFilter();
+  }
+  private updateStratigraphy(grid:Grid,frame:Frame){
+    const data=buildStratifiedGeometry(grid);
+    this.strata.geometry.dispose();
+    if(!data){
+      this.strata.geometry=new THREE.BufferGeometry();
+      this.strata.userData.hasData=false;this.strata.visible=false;
+      this.renderer.domElement.dataset.stratigraphyLayers="0";
+      return;
+    }
+    const geometry=new THREE.BufferGeometry();
+    geometry.setAttribute("position",new THREE.BufferAttribute(data.positions,3));
+    geometry.setIndex(new THREE.BufferAttribute(data.indices,1));
+    for(const group of data.groups)geometry.addGroup(group.start,group.count,group.productIndex);
+    geometry.computeVertexNormals();geometry.computeBoundingBox();geometry.computeBoundingSphere();
+    this.strata.geometry=geometry;this.strata.material=this.surfaceMaterials;
+    this.strata.userData.hasData=true;this.strata.visible=this.layers.piles;
+    this.renderer.domElement.dataset.stratigraphyLayers=String(data.layerCount);
+    this.renderer.domElement.dataset.stratigraphyCells=String(data.cellCount);
+    this.applyProductFilter();
+  }
   private updateSurface(grid: Grid, frame: Frame, animate: boolean) {
     const signature=`${grid.nx}:${grid.ny}:${grid.cell_m}:${grid.x0}:${grid.y0}`;
     const sameLayout=signature===this.surfaceSignature;
@@ -304,35 +370,28 @@ export class YardScene {
     const from=sameLayout && previous ? Float32Array.from({length:previous.count},(_,i)=>
       Math.max(0,previous.getZ(i)-SURFACE_OFFSET_M)) : undefined;
     const data=buildStockpileSurface(grid,animate?from:undefined);
-    const palette=frame.config.products.map(p=>new THREE.Color(p.color));
-    const neutral=new THREE.Color(0xb9c7c1),colors=new Float32Array(data.positions.length);
-    for(let i=0;i<data.heights.length;i++){
-      const color=palette[data.productIndices[i]]??neutral;
-      colors.set([color.r,color.g,color.b],i*3);
-    }
+    this.ensureSurfaceMaterials(frame);
+    this.updateStratigraphy(grid,frame);
     let geometry=this.surface.geometry;
     if(!sameLayout || previous?.count!==data.heights.length){
       geometry.dispose();geometry=new THREE.BufferGeometry();this.surface.geometry=geometry;
       geometry.setAttribute("position",new THREE.BufferAttribute(data.positions,3).setUsage(THREE.DynamicDrawUsage));
-      geometry.setAttribute("color",new THREE.BufferAttribute(colors,3).setUsage(THREE.DynamicDrawUsage));
-      // Allocate maximum topology once; subsequent acquisitions update in place.
-      geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(data.maxIndexCount),1).setUsage(THREE.DynamicDrawUsage));
-    }else{
-      (geometry.attributes.color as THREE.BufferAttribute).array.set(colors);geometry.attributes.color.needsUpdate=true;
-    }
-    const index=geometry.getIndex()!;
-    if ((index.array as Uint32Array).length < data.indices.length) {
       geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(data.maxIndexCount),1).setUsage(THREE.DynamicDrawUsage));
     }
-    const indexArray=(geometry.getIndex()!.array as Uint32Array);
+    if((geometry.getIndex()?.array.length??0)<data.indices.length){
+      geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(data.maxIndexCount),1).setUsage(THREE.DynamicDrawUsage));
+    }
+    const indexArray=geometry.getIndex()!.array as Uint32Array;
     indexArray.fill(0);indexArray.set(data.indices);
-    geometry.getIndex()!.needsUpdate=true;geometry.setDrawRange(0,data.indices.length);
+    geometry.getIndex()!.needsUpdate=true;geometry.setDrawRange(0,data.indices.length);geometry.clearGroups();
+    const neutralIndex=frame.config.products.length;
+    for(const group of data.groups)geometry.addGroup(group.start,group.count,group.productIndex>=0?group.productIndex:neutralIndex);
     this.surfaceSignature=signature;this.surfaceTargets=data.heights;
     const source=animate && from?.length===data.heights.length ? from : data.heights;
     const positions=geometry.attributes.position as THREE.BufferAttribute;
     writeInterpolatedHeights(positions.array as Float32Array,source,data.heights,0);
     this.surfaceTween=animate ? {at:performance.now()*.001,from:source,to:data.heights} : null;
-    this.refreshSurface();
+    this.refreshSurface();this.applyProductFilter();
   }
   private refreshSurface() {
     const geometry=this.surface.geometry;
@@ -400,7 +459,7 @@ export class YardScene {
     }
   }
   setLayers(layers: Layers) {
-    this.layers=layers;this.map.visible=layers.map;this.surface.visible=layers.piles;this.machine.visible=layers.machine;
+    this.layers=layers;this.map.visible=layers.map;this.surface.visible=layers.piles;this.strata.visible=layers.piles&&!!this.strata.userData.hasData;this.machine.visible=layers.machine;
     this.scannerVisual.visible=layers.scanner;this.points.visible=layers.points;this.observed.visible=layers.measured;
     this.gridLines.visible=layers.grid;this.labels.visible=layers.labels;
   }
@@ -481,7 +540,7 @@ export class YardScene {
     }
     if(!this.pointerOrigin||Math.hypot(event.clientX-this.pointerOrigin.x,event.clientY-this.pointerOrigin.y)>5)return;
     const p=this.yardPoint(event);if(!p)return;
-    const hits=p.ray.intersectObjects([this.machine,this.surface],true);
+    const hits=p.ray.intersectObjects([this.machine,this.strata,this.surface],true);
     for(const hit of hits){
       let object:THREE.Object3D|null=hit.object;
       while(object&&!object.userData.kind)object=object.parent;
@@ -491,9 +550,14 @@ export class YardScene {
       const kind=object.userData.kind as Picked;this.onPick(kind);
       if(kind==="pile"){
         const world=this.root.worldToLocal(hit.point.clone());
-        const x0=Math.max(0,world.x-30),x1=Math.min(360,world.x+30);
-        const area={x0:Math.round(x0*10)/10,x1:Math.round(x1*10)/10,y0:world.y<0?-48:14,y1:world.y<0?-14:48};
-        this.onArea(area);this.selectArea(area);
+        const grid=this.currentGrid;
+        if(grid){
+          const cx=Math.max(0,Math.min(grid.nx-1,Math.floor((world.x-grid.x0)/grid.cell_m)));
+          const cy=Math.max(0,Math.min(grid.ny-1,Math.floor((world.y-grid.y0)/grid.cell_m)));
+          const area={x0:grid.x0+cx*grid.cell_m,x1:grid.x0+(cx+1)*grid.cell_m,
+            y0:grid.y0+cy*grid.cell_m,y1:grid.y0+(cy+1)*grid.cell_m};
+          this.onArea(area);this.selectArea(area);
+        }
       }break;
     }
   };

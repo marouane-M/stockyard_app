@@ -90,6 +90,21 @@ class Product(Model):
 
 
 
+
+
+class JobArea(Model):
+    x0: float = Field(40, ge=0, le=360)
+    x1: float = Field(300, ge=0, le=360)
+    y0: float = Field(-48, ge=-54, le=54)
+    y1: float = Field(-14, ge=-54, le=54)
+    source: Literal["form", "map"] = "form"
+
+    @model_validator(mode="after")
+    def validate_area(self):
+        if self.x1 <= self.x0 or self.y1 <= self.y0:
+            raise ValueError("La zone du job doit avoir une longueur et une largeur positives.")
+        return self
+
 class SimulationPass(Model):
     product_id: str = Field(min_length=1, max_length=30, pattern=r"^[A-Z0-9-]+$")
     target_tonnage_t: float = Field(2500, ge=0, le=100000)
@@ -100,22 +115,32 @@ class SimulationPass(Model):
 class SimulationJobConfig(Model):
     name: str = Field("Scénario de démonstration", min_length=1, max_length=100)
     storage_type: Literal["mound", "gaussian", "longitudinal", "alternating", "conical"] = "mound"
+    placement_mode: Literal["adjacent", "layered"] = "adjacent"
     start_m: float = Field(40, ge=0, le=350)
     end_m: float = Field(300, ge=10, le=360)
     lane: Literal["north", "south"] = "south"
+    area: JobArea | None = None
+    max_height_m: float = Field(12, ge=1, le=18)
     travel_speed_m_s: float = Field(0.08, ge=0.005, le=0.3)
     flow_t_h: float = Field(1800, ge=0, le=6000)
     time_scale: float = Field(300, ge=1, le=600)
-    reset_before_start: bool = True
+    reset_before_start: bool = False
     passes: list[SimulationPass] = Field(min_length=1, max_length=12)
 
     @model_validator(mode="after")
     def validate_job(self):
         if self.end_m - self.start_m < 12:
             raise ValueError("La distance du job doit être d'au moins 12 m.")
+        if self.area is not None:
+            self.start_m = self.area.x0
+            self.end_m = self.area.x1
         if self.storage_type == "alternating" and len(self.passes) < 2:
             raise ValueError("Le stockage alterné nécessite au moins deux passages.")
         return self
+
+
+class SimulationJobValidationRequest(Model):
+    config: SimulationJobConfig
 
 
 class SimulationJobCreate(Model):

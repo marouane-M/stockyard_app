@@ -12,7 +12,8 @@ from .inventory import AREA, NX, NY, XX, YY
 
 
 def deposit_mound(x: float, y: float, mass: float, product: dict,
-                  heights: np.ndarray, repose_angle_deg: float = 34.0) -> dict:
+                  heights: np.ndarray, repose_angle_deg: float = 34.0,
+                  bounds: tuple[float, float, float, float] | None = None) -> dict:
     """Raise a cone over the current heightfield by exactly mass / density.
 
     Let d_i be distance from the discharge point and h_i the existing column.
@@ -40,9 +41,15 @@ def deposit_mound(x: float, y: float, mass: float, product: dict,
         return result
 
     # Same governed storage lanes as v2; no stock is placed on the central rail.
-    eligible = ((np.abs(YY) >= 14) & (np.abs(YY) <= 48)
-                & ((YY > 0) == (y > 0))).ravel()
+    eligible_grid = ((np.abs(YY) >= 14) & (np.abs(YY) <= 48)
+                     & ((YY > 0) == (y > 0)))
+    if bounds is not None:
+        x0, x1, y0, y1 = bounds
+        eligible_grid &= ((XX >= x0) & (XX <= x1) & (YY >= y0) & (YY <= y1))
+    eligible = eligible_grid.ravel()
     indices = np.flatnonzero(eligible)
+    if len(indices) == 0:
+        raise ValueError("La zone du job ne contient aucune cellule de stockage exploitable.")
     distance = np.hypot(XX.ravel()[indices] - x, YY.ravel()[indices] - y)
     thresholds = current[indices] + math.tan(math.radians(repose_angle_deg)) * distance
     # Subtract the smallest threshold to improve precision for tiny deposits.

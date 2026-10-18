@@ -16,7 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from .engine import Engine
 from .geometry import GeoConverter
-from .models import Command, ConfigChange, Correction, Selection, SiteConfig, SimulationJobCreate, SimulationJobCommand
+from .models import (Command, ConfigChange, Correction, Selection, SiteConfig,
+                     SimulationJobCreate, SimulationJobCommand, SimulationJobValidationRequest)
 
 logger = logging.getLogger("stockyard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -152,6 +153,11 @@ def create_app(engine: Engine | None = None, auto_tick: bool = True) -> FastAPI:
     async def simulation_jobs():
         async with lock:
             return service.list_jobs()
+
+    @app.post("/api/simulation/jobs/validate")
+    async def simulation_validate(payload: SimulationJobValidationRequest):
+        async with lock:
+            return service.validate_job(payload.config)
 
     @app.post("/api/simulation/jobs")
     async def simulation_create(payload: SimulationJobCreate):

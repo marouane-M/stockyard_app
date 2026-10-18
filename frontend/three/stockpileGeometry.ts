@@ -6,11 +6,13 @@ export type HeightGrid = {
   nx: number; ny: number; cell_m: number; x0: number; y0: number;
   heights_m: readonly number[]; product_indices: readonly number[];
 };
-export const SURFACE_OFFSET_M = 0.025; // depth bias only, NOT a height multiplier
-export const STOCKPILE_DISPLAY_DETAIL = 4; // four render samples per backend cell for a clean surface
+export const SURFACE_OFFSET_M = 0.025;
+export const STOCKPILE_DISPLAY_DETAIL = 3;
+export type SurfaceGroup = { productIndex: number; start: number; count: number };
 export type StockpileSurface = {
   positions: Float32Array; heights: Float32Array; productIndices: Int16Array;
-  indices: Uint32Array; peak: { x: number; y: number; height: number };
+  indices: Uint32Array; groups: SurfaceGroup[];
+  peak: { x: number; y: number; height: number };
   maxIndexCount: number;
 };
 
@@ -24,156 +26,158 @@ function assertGrid(grid: HeightGrid) {
   }
 }
 
-function cellIndex(grid: HeightGrid, x: number, y: number): number {
-  return y * grid.nx + x;
+const clamp=(v:number,min:number,max:number)=>Math.max(min,Math.min(max,v));
+const idx=(nx:number,x:number,y:number)=>y*nx+x;
+
+function median(values:number[]):number{
+  const clean=values.filter(Number.isFinite).sort((a,b)=>a-b);
+  return clean.length?clean[Math.floor(clean.length/2)]:0;
 }
 
-function cellHeight(grid: HeightGrid, x: number, y: number): number {
-  if (x < 0 || y < 0 || x >= grid.nx || y >= grid.ny) return 0;
-  return grid.heights_m[cellIndex(grid, x, y)] ?? 0;
-}
-
-function productAt(grid: HeightGrid, x: number, y: number): number {
-  if (x < 0 || y < 0 || x >= grid.nx || y >= grid.ny) return -1;
-  return grid.product_indices[cellIndex(grid, x, y)] ?? -1;
-}
-
-function sampleHeight(grid: HeightGrid, gx: number, gy: number): number {
-  // Boundary vertices are pinned to ground so the rendered pile has a clean rim.
-  if (gx <= 0 || gy <= 0 || gx >= grid.nx || gy >= grid.ny) return 0;
-
-  // Source values are cell-centre heights. Convert render coordinates to
-  // fractional cell-centre coordinates, then bilinearly interpolate. This
-  // removes the square/pixel look without changing the backend inventory grid.
-  const sx = gx - 0.5;
-  const sy = gy - 0.5;
-  const x0 = Math.floor(sx);
-  const y0 = Math.floor(sy);
-  const tx = sx - x0;
-  const ty = sy - y0;
-  const h00 = cellHeight(grid, x0, y0);
-  const h10 = cellHeight(grid, x0 + 1, y0);
-  const h01 = cellHeight(grid, x0, y0 + 1);
-  const h11 = cellHeight(grid, x0 + 1, y0 + 1);
-  const a = h00 * (1 - tx) + h10 * tx;
-  const b = h01 * (1 - tx) + h11 * tx;
-  return a * (1 - ty) + b * ty;
-}
-
-function nearestProduct(grid: HeightGrid, gx: number, gy: number): number {
-  const x = Math.max(0, Math.min(grid.nx - 1, Math.floor(gx)));
-  const y = Math.max(0, Math.min(grid.ny - 1, Math.floor(gy)));
-  const direct = productAt(grid, x, y);
-  if (direct >= 0) return direct;
-
-  // For interpolated edge vertices, borrow the closest visible product only for
-  // display. This does not create mass or modify the authoritative inventory.
-  let best = -1;
-  let bestH = 0;
-  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-    const px = x + dx;
-    const py = y + dy;
-    const h = cellHeight(grid, px, py);
-    const product = productAt(grid, px, py);
-    if (product >= 0 && h > bestH) {
-      best = product;
-      bestH = h;
+/**
+ * Robust display smoothing. It suppresses isolated LiDAR spikes and square cell
+ * edges without touching the backend grid, volume or tonnage.
+ */
+function smoothDisplayGrid(grid: HeightGrid): Float32Array {
+  const {nx,ny}=grid;
+  const source=Float32Array.from(grid.heights_m);
+  const medianPass=new Float32Array(source.length);
+  for(let y=0;y<ny;y++) for(let x=0;x<nx;x++){
+    const values:number[]=[];
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+      const px=x+dx,py=y+dy;
+      if(px>=0&&py>=0&&px<nx&&py<ny){
+        const h=source[idx(nx,px,py)];
+        if(h>0.001)values.push(h);
+      }
     }
+    const current=source[idx(nx,x,y)];
+    medianPass[idx(nx,x,y)]=current>0.001?median(values):0;
   }
+  let input=medianPass;
+  for(let pass=0;pass<2;pass++){
+    const output=new Float32Array(input.length);
+    for(let y=0;y<ny;y++) for(let x=0;x<nx;x++){
+      const center=input[idx(nx,x,y)];
+      let weighted=0,total=0,positive=0;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+        const px=clamp(x+dx,0,nx-1),py=clamp(y+dy,0,ny-1);
+        const h=input[idx(nx,px,py)];
+        const w=(dx===0?2:1)*(dy===0?2:1);
+        if(h>0.001){weighted+=h*w;total+=w;positive++;}
+      }
+      // Never spread a lone point into a wide flat plate. A small connected
+      // neighbourhood is required before a cell is displayed as material.
+      output[idx(nx,x,y)]=center>0.001 || positive>=3 ? (total?weighted/total:0) : 0;
+    }
+    input=output;
+  }
+  return input;
+}
+
+function sourceHeight(smooth:Float32Array,nx:number,ny:number,x:number,y:number):number{
+  return smooth[idx(nx,clamp(x,0,nx-1),clamp(y,0,ny-1))]??0;
+}
+function cubic(p0:number,p1:number,p2:number,p3:number,t:number):number{
+  const t2=t*t,t3=t2*t;
+  return .5*((2*p1)+(-p0+p2)*t+(2*p0-5*p1+4*p2-p3)*t2+(-p0+3*p1-3*p2+p3)*t3);
+}
+function sampleHeight(smooth:Float32Array,grid:HeightGrid,gx:number,gy:number):number{
+  if(gx<=0||gy<=0||gx>=grid.nx||gy>=grid.ny)return 0;
+  const sx=gx-.5,sy=gy-.5;
+  const x1=Math.floor(sx),y1=Math.floor(sy),tx=sx-x1,ty=sy-y1;
+  const rows:number[]=[];
+  for(let r=-1;r<=2;r++){
+    rows.push(cubic(
+      sourceHeight(smooth,grid.nx,grid.ny,x1-1,y1+r),
+      sourceHeight(smooth,grid.nx,grid.ny,x1,y1+r),
+      sourceHeight(smooth,grid.nx,grid.ny,x1+1,y1+r),
+      sourceHeight(smooth,grid.nx,grid.ny,x1+2,y1+r),tx));
+  }
+  const value=cubic(rows[0],rows[1],rows[2],rows[3],ty);
+  return Math.max(0,value);
+}
+function productAt(grid:HeightGrid,x:number,y:number):number{
+  if(x<0||y<0||x>=grid.nx||y>=grid.ny)return -1;
+  return grid.product_indices[idx(grid.nx,x,y)]??-1;
+}
+function nearestProduct(grid:HeightGrid,gx:number,gy:number):number{
+  const x=clamp(Math.floor(gx),0,grid.nx-1),y=clamp(Math.floor(gy),0,grid.ny-1);
+  const direct=productAt(grid,x,y);if(direct>=0)return direct;
+  let best=-1,bestH=0;
+  for(let radius=1;radius<=2;radius++) for(let dy=-radius;dy<=radius;dy++) for(let dx=-radius;dx<=radius;dx++){
+    const px=x+dx,py=y+dy;if(px<0||py<0||px>=grid.nx||py>=grid.ny)continue;
+    const h=grid.heights_m[idx(grid.nx,px,py)]??0,p=productAt(grid,px,py);
+    if(p>=0&&h>bestH){best=p;bestH=h;}
+  }
+  return best;
+}
+function triangleProduct(a:number,b:number,c:number,products:Int16Array,heights:Float32Array):number{
+  const scores=new Map<number,number>();
+  for(const v of [a,b,c]){
+    const p=products[v];if(p<0||heights[v]<=.001)continue;
+    scores.set(p,(scores.get(p)??0)+Math.max(.05,heights[v]));
+  }
+  let best=-1,score=-1;for(const [p,s] of scores)if(s>score){best=p;score=s;}
   return best;
 }
 
 export function buildStockpileSurface(grid: HeightGrid, previous?: ArrayLike<number>): StockpileSurface {
   assertGrid(grid);
-  const { nx, ny, cell_m: cell, x0, y0 } = grid;
-  const detail = STOCKPILE_DISPLAY_DETAIL;
-  const vx = nx * detail + 1;
-  const vy = ny * detail + 1;
-  const count = vx * vy;
-  const positions = new Float32Array(count * 3);
-  const heights = new Float32Array(count);
-  const productIndices = new Int16Array(count); productIndices.fill(-1);
-  const triangles: number[] = [];
-  const peak = { x: x0, y: y0, height: 0 };
-
-  for (let row = 0; row < vy; row++) for (let col = 0; col < vx; col++) {
-    const i = row * vx + col;
-    const gx = col / detail;
-    const gy = row / detail;
-    const x = x0 + gx * cell;
-    const y = y0 + gy * cell;
-    const h = sampleHeight(grid, gx, gy);
-    heights[i] = h;
-    positions.set([x, y, h + SURFACE_OFFSET_M], i * 3);
-    productIndices[i] = h > 0.001 ? nearestProduct(grid, gx, gy) : -1;
-    if (h > peak.height) Object.assign(peak, { x, y, height: h });
+  const {nx,ny,cell_m:cell,x0,y0}=grid;
+  const smooth=smoothDisplayGrid(grid),detail=STOCKPILE_DISPLAY_DETAIL;
+  const vx=nx*detail+1,vy=ny*detail+1,count=vx*vy;
+  const positions=new Float32Array(count*3),heights=new Float32Array(count),productIndices=new Int16Array(count);productIndices.fill(-1);
+  const peak={x:x0,y:y0,height:0};
+  for(let row=0;row<vy;row++)for(let col=0;col<vx;col++){
+    const i=row*vx+col,gx=col/detail,gy=row/detail,x=x0+gx*cell,y=y0+gy*cell;
+    const h=sampleHeight(smooth,grid,gx,gy);
+    heights[i]=h;positions.set([x,y,h+SURFACE_OFFSET_M],i*3);
+    productIndices[i]=h>.001?nearestProduct(grid,gx,gy):-1;
+    if(h>peak.height)Object.assign(peak,{x,y,height:h});
+  }
+  // Keep the measured/source maximum exact while its neighbours remain smooth.
+  let sourcePeak=0,sourcePeakIndex=-1;
+  for(let i=0;i<grid.heights_m.length;i++)if(grid.heights_m[i]>sourcePeak){sourcePeak=grid.heights_m[i];sourcePeakIndex=i;}
+  if(sourcePeakIndex>=0){
+    const sx=sourcePeakIndex%nx,sy=Math.floor(sourcePeakIndex/nx),col=Math.round((sx+.5)*detail),row=Math.round((sy+.5)*detail),i=row*vx+col;
+    heights[i]=sourcePeak;positions[i*3+2]=sourcePeak+SURFACE_OFFSET_M;productIndices[i]=grid.product_indices[sourcePeakIndex]??-1;
+    if(sourcePeak>=peak.height)Object.assign(peak,{x:x0+(sx+.5)*cell,y:y0+(sy+.5)*cell,height:sourcePeak});
   }
 
-  // Ensure the reported/displayed peak is retained exactly even after display
-  // interpolation. The mesh remains smooth around it because surrounding render
-  // vertices are already bilinear samples.
-  let sourcePeak = 0, sourcePeakIndex = -1;
-  for (let i = 0; i < grid.heights_m.length; i++) {
-    const h = grid.heights_m[i];
-    if (h > sourcePeak) { sourcePeak = h; sourcePeakIndex = i; }
-  }
-  if (sourcePeakIndex >= 0 && sourcePeak > peak.height) {
-    const sx = sourcePeakIndex % nx;
-    const sy = Math.floor(sourcePeakIndex / nx);
-    const col = Math.round((sx + 0.5) * detail);
-    const row = Math.round((sy + 0.5) * detail);
-    const i = row * vx + col;
-    heights[i] = sourcePeak;
-    positions[i * 3 + 2] = sourcePeak + SURFACE_OFFSET_M;
-    productIndices[i] = grid.product_indices[sourcePeakIndex] ?? -1;
-    Object.assign(peak, { x: x0 + (sx + 0.5) * cell, y: y0 + (sy + 0.5) * cell, height: sourcePeak });
-  }
-
-  for (let row = 0; row < vy - 1; row++) for (let col = 0; col < vx - 1; col++) {
-    const a = row * vx + col;
-    const b = a + 1;
-    const c = a + vx;
-    const d = c + 1;
-    const vertices = [a, b, c, d];
-    if (!vertices.some(v => heights[v] > 0.001 || (previous?.[v] ?? 0) > 0.001)) continue;
-    triangles.push(a, b, c, b, d, c);
-  }
-
-  return {
-    positions,
-    heights,
-    productIndices,
-    indices: new Uint32Array(triangles),
-    peak,
-    maxIndexCount: (vx - 1) * (vy - 1) * 6
+  // Two-pass grouping avoids allocating very large JavaScript number arrays.
+  // At full-yard scale, those temporary arrays were the main source of browser
+  // memory spikes when a new LiDAR profile arrived several times per second.
+  const counts=new Map<number,number>();
+  const visitTriangles=(consumer:(product:number,a:number,b:number,c:number)=>void)=>{
+    for(let row=0;row<vy-1;row++)for(let col=0;col<vx-1;col++){
+      const a=row*vx+col,b=a+1,c=a+vx,d=c+1;
+      if(![a,b,c,d].some(v=>heights[v]>.001||(previous?.[v]??0)>.001))continue;
+      for(const tri of [[a,b,c],[b,d,c]] as const){
+        const product=triangleProduct(tri[0],tri[1],tri[2],productIndices,heights);
+        consumer(product,tri[0],tri[1],tri[2]);
+      }
+    }
   };
+  visitTriangles(product=>counts.set(product,(counts.get(product)??0)+3));
+  const ordered=[...counts.keys()].sort((a,b)=>a-b),groups:SurfaceGroup[]=[];
+  let total=0;
+  for(const productIndex of ordered){const count=counts.get(productIndex)!;groups.push({productIndex,start:total,count});total+=count;}
+  const indices=new Uint32Array(total),cursor=new Map<number,number>();
+  for(const group of groups)cursor.set(group.productIndex,group.start);
+  visitTriangles((product,a,b,c)=>{
+    const at=cursor.get(product)!;indices[at]=a;indices[at+1]=b;indices[at+2]=c;cursor.set(product,at+3);
+  });
+  return {positions,heights,productIndices,indices,groups,peak,maxIndexCount:(vx-1)*(vy-1)*6};
 }
 
-/** Smooth only between received surfaces. No prediction or fabricated height. */
-export function writeInterpolatedHeights(positions: Float32Array, from: ArrayLike<number>,
-                                         to: ArrayLike<number>, progress: number): number {
-  if (positions.length !== to.length * 3 || from.length !== to.length) {
-    throw new Error("Tailles de surface incompatibles.");
-  }
-  const t = Math.max(0, Math.min(1, progress)), blend = t * t * (3 - 2 * t);
-  let peak = 0;
-  for (let i = 0; i < to.length; i++) {
-    const h = from[i] + (to[i] - from[i]) * blend;
-    positions[i * 3 + 2] = h + SURFACE_OFFSET_M; peak = Math.max(peak, h);
-  }
-  return peak;
+export function writeInterpolatedHeights(positions:Float32Array,from:ArrayLike<number>,to:ArrayLike<number>,progress:number):number{
+  if(positions.length!==to.length*3||from.length!==to.length)throw new Error("Tailles de surface incompatibles.");
+  const t=Math.max(0,Math.min(1,progress)),blend=t*t*(3-2*t);let peak=0;
+  for(let i=0;i<to.length;i++){const h=from[i]+(to[i]-from[i])*blend;positions[i*3+2]=h+SURFACE_OFFSET_M;peak=Math.max(peak,h);}return peak;
 }
-
-/** Height of the displayed surface directly under the material stream. */
-export function sampleStockpileHeight(grid: HeightGrid, positions: ArrayLike<number>, x: number, y: number): number {
-  const gx = (x - grid.x0) / grid.cell_m;
-  const gy = (y - grid.y0) / grid.cell_m;
-  if (gx < 0 || gy < 0 || gx > grid.nx || gy > grid.ny) return 0;
-  const detail = STOCKPILE_DISPLAY_DETAIL;
-  const vx = grid.nx * detail + 1;
-  const col = Math.max(0, Math.min(vx - 1, Math.round(gx * detail)));
-  const row = Math.max(0, Math.min(grid.ny * detail, Math.round(gy * detail)));
-  const i = row * vx + col;
-  const z = positions[i * 3 + 2];
-  return Number.isFinite(z) ? Math.max(0, z) : 0;
+export function sampleStockpileHeight(grid:HeightGrid,positions:ArrayLike<number>,x:number,y:number):number{
+  const gx=(x-grid.x0)/grid.cell_m,gy=(y-grid.y0)/grid.cell_m;if(gx<0||gy<0||gx>grid.nx||gy>grid.ny)return 0;
+  const detail=STOCKPILE_DISPLAY_DETAIL,vx=grid.nx*detail+1,col=clamp(Math.round(gx*detail),0,vx-1),row=clamp(Math.round(gy*detail),0,grid.ny*detail),i=row*vx+col;
+  const z=positions[i*3+2];return Number.isFinite(z)?Math.max(0,z):0;
 }

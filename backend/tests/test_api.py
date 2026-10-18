@@ -63,3 +63,42 @@ def test_provider_is_optional_and_map_failure_is_explicit(monkeypatch):
     with TestClient(create_app(Engine(),auto_tick=False)) as client:
         assert client.get("/api/map").json()["tiles"] == []
         assert client.get("/api/map/tiles/17/0/0").status_code == 503
+
+
+def test_job_validation_api_and_positioning_state():
+    engine = Engine()
+    with TestClient(create_app(engine, auto_tick=False)) as client:
+        config = {
+            "name": "Job depuis la carte",
+            "storage_type": "longitudinal",
+            "placement_mode": "adjacent",
+            "start_m": 80,
+            "end_m": 180,
+            "lane": "south",
+            "area": {"x0": 80, "x1": 180, "y0": -48, "y1": -14, "source": "map"},
+            "max_height_m": 8,
+            "travel_speed_m_s": 0.08,
+            "flow_t_h": 1800,
+            "time_scale": 300,
+            "reset_before_start": False,
+            "passes": [
+                {"product_id": "LAVE-A", "target_tonnage_t": 200, "direction": "forward", "lane": "auto"},
+                {"product_id": "LAVE-B", "target_tonnage_t": 150, "direction": "backward", "lane": "auto"},
+            ],
+        }
+        preview = client.post("/api/simulation/jobs/validate", json={"config": config})
+        assert preview.status_code == 200
+        body = preview.json()
+        assert body["valid"] is True
+        assert body["area"]["source"] == "map"
+        assert body["planned_passes"][0]["x1"] < body["planned_passes"][1]["x0"]
+        created = client.post("/api/simulation/jobs", json={
+            "config": config, "operator": "Recette", "reason": "Validation API du plan de stockage"
+        })
+        assert created.status_code == 200
+        job = created.json()
+        started = client.post(f"/api/simulation/jobs/{job['id']}/command",
+                              json={"action": "start", "confirm": True})
+        assert started.status_code == 200
+        assert started.json()["status"] == "EN_DEPLACEMENT"
+        assert engine.truth.heights.sum() == 0
