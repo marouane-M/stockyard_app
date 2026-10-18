@@ -1,0 +1,14 @@
+{
+  "status": "PASS",
+  "server": "Uvicorn local, sans Docker",
+  "websocket_clients": 2,
+  "sequence": 21,
+  "tonnage_t": 315.0,
+  "raw_preserved_after_correction": true,
+  "exact_spatial_partition": true,
+  "outage_reconciled": true,
+  "stop_verified": true,
+  "csv_export": true,
+  "map_imagery": "désactivée pour ce test",
+  "frontend": "non exécuté"
+}

@@ -1,0 +1,22 @@
+# Optional hot reload. Use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  backend:
+    build:
+      target: base
+    volumes:
+      - ./backend/app:/app/app:ro
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+  frontend:
+    build:
+      target: deps
+    volumes:
+      - ./frontend:/app
+      - frontend-deps:/app/node_modules
+      - frontend-next:/app/.next
+    command: ["npm", "run", "dev"]
+    environment:
+      NEXT_TELEMETRY_DISABLED: "1"
+      WATCHPACK_POLLING: "true"
+volumes:
+  frontend-deps:
+  frontend-next:

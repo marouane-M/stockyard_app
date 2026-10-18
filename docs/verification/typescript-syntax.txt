@@ -1,0 +1,2 @@
+TypeScript 5.8.3 — 17 fichiers — 0 erreur(s) de syntaxe.
+La résolution des dépendances, le typage complet et le rendu Next.js ne sont PAS vérifiés par ce script.
